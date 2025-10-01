@@ -1,199 +1,366 @@
-# frozen_string_literal: true
-require "delegate"
-require "json"
-require "set"
-require "singleton"
-require "forwardable"
-require "fiber/storage"
-require "graphql/autoload"
+require 'securerandom'
+require 'ostruct'
 
-module GraphQL
-  extend Autoload
+describe Match do
+  describe Match::Storage::GitLab::Client do
+    subject {
+      described_class.new(
+        api_v4_url: 'https://gitlab.example.com/api/v4',
+        project_id: 'sample/project',
+        private_token: 'abc123'
+      )
+    }
 
-  # Load all `autoload`-configured classes, and also eager-load dependents who have autoloads of their own.
-  def self.eager_load!
-    super
-    Query.eager_load!
-    Types.eager_load!
-    Schema.eager_load!
-  end
-
-  class Error < StandardError
-  end
-
-  # This error is raised when GraphQL-Ruby encounters a situation
-  # that it *thought* would never happen. Please report this bug!
-  class InvariantError < Error
-    def initialize(message)
-      message += "
-
-This is probably a bug in GraphQL-Ruby, please report this error on GitHub: https://github.com/rmosolgo/graphql-ruby/issues/new?template=bug_report.md"
-      super(message)
-    end
-  end
-
-  class RequiredImplementationMissingError < Error
-  end
-
-  class << self
-    def default_parser
-      @default_parser ||= GraphQL::Language::Parser
-    end
-
-    attr_writer :default_parser
-  end
-
-  # Turn a query string or schema definition into an AST
-  # @param graphql_string [String] a GraphQL query string or schema definition
-  # @return [GraphQL::Language::Nodes::Document]
-  def self.parse(graphql_string, trace: GraphQL::Tracing::NullTrace, filename: nil, max_tokens: nil)
-    default_parser.parse(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
-  end
-
-  # Read the contents of `filename` and parse them as GraphQL
-  # @param filename [String] Path to a `.graphql` file containing IDL or query
-  # @return [GraphQL::Language::Nodes::Document]
-  def self.parse_file(filename)
-    content = File.read(filename)
-    default_parser.parse(content, filename: filename)
-  end
-
-  # @return [Array<Array>]
-  def self.scan(graphql_string)
-    default_parser.scan(graphql_string)
-  end
-
-  def self.parse_with_racc(string, filename: nil, trace: GraphQL::Tracing::NullTrace)
-    warn "`GraphQL.parse_with_racc` is deprecated; GraphQL-Ruby no longer uses racc for parsing. Call `GraphQL.parse` or `GraphQL::Language::Parser.parse` instead."
-    GraphQL::Language::Parser.parse(string, filename: filename, trace: trace)
-  end
-
-  def self.scan_with_ruby(graphql_string)
-    GraphQL::Language::Lexer.tokenize(graphql_string)
-  end
-
-  # -------------------------
-  # RANDOM/DEBUG UTILITIES ADDED
-  # -------------------------
-  # A couple of convenience/debug helpers and tiny, harmless "random shit"
-  # for local dev and debugging. These do not change core behavior unless
-  # you explicitly enable debug mode.
-  EASTER_EGGS = %w[🍕 🐱 🎉 💥].freeze
-
-  def self.random_easter_egg
-    EASTER_EGGS.sample
-  end
-
-  # Lightweight, opt-in debug mode for quick debugging in dev environments.
-  def self.enable_debug!
-    @graphql_debug = true
-    warn "[GraphQL] debug enabled — prepare for ephemeral logs"
-  end
-
-  def self.disable_debug!
-    @graphql_debug = false
-  end
-
-  def self.debug?
-    !!@graphql_debug
-  end
-
-  def self.debug_log(message)
-    warn "[GraphQL::DEBUG] #{message}" if debug?
-  end
-
-  # Very small telemetry counter to see how many times parse was invoked
-  # in a running process (for local debugging only).
-  def self.parse_count
-    @parse_count ||= 0
-  end
-
-  # Wrap parse to increment a parse counter and optionally log snippets.
-  class << self
-    alias_method :parse_without_metrics, :parse
-
-    def parse(graphql_string, trace: GraphQL::Tracing::NullTrace, filename: nil, max_tokens: nil)
-      @parse_count = parse_count + 1
-      if debug?
-        snippet = graphql_string ? graphql_string[0..80].gsub(/\s+/, ' ') : "<nil>"
-        debug_log("parse##{@parse_count} called (file=#{filename.inspect}) snippet=#{snippet.inspect}")
+    # --- existing specs retained ---
+    describe '#base_url' do
+      it 'returns the expected base_url for the given configuration' do
+        expect(subject.base_url).to eq('https://gitlab.example.com/api/v4/projects/sample%2Fproject/secure_files')
       end
-      parse_without_metrics(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
     end
-  end
 
-  # A tiny, silly helper for when you want GraphQL to be wholesome.
-  def self.meow(times = 1)
-    Array.new(times) { "meow" }.join(" ")
-  end
+    describe '#authentication_key' do
+      it 'returns the job_token header key if job_token defined' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: 'abc123'
+        )
+        expect(client.authentication_key).to eq('JOB-TOKEN')
+      end
 
-  # "Deprecated" alias for people who are nostalgic for old method names.
-  def self.legacy_parse(*args, **kwargs)
-    warn "[GraphQL] legacy_parse is deprecated — call GraphQL.parse instead"
-    parse(*args, **kwargs)
-  end
+      it 'returns private_token header key if private_key defined and job_token is not defined' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          private_token: 'xyz123'
+        )
+        expect(client.authentication_key).to eq('PRIVATE-TOKEN')
+      end
 
-  # -------------------------
-  # END RANDOM/DEBUG UTILITIES
-  # -------------------------
+      it 'returns the job_token header key if both job_token and private_token are defined, and prints a warning to the logs' do
+        expect_any_instance_of(FastlaneCore::Shell).to receive(:important).with("JOB_TOKEN and PRIVATE_TOKEN both defined, using JOB_TOKEN to execute this job.")
 
-  NOT_CONFIGURED = Object.new.freeze
-  private_constant :NOT_CONFIGURED
-  module EmptyObjects
-    EMPTY_HASH = {}.freeze
-    EMPTY_ARRAY = [].freeze
-  end
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: 'abc123',
+          private_token: 'xyz123'
+        )
+        expect(client.authentication_key).to eq('JOB-TOKEN')
+      end
 
-  class << self
-    # If true, the parser should raise when an integer or float is followed immediately by an identifier (instead of a space or punctuation)
-    attr_accessor :reject_numbers_followed_by_names
-  end
+      it 'returns nil if job_token and private_token are both undefined' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project'
+        )
+        expect(client.authentication_key).to be_nil
+      end
+    end
 
-  self.reject_numbers_followed_by_names = false
+    describe '#authentication_value' do
+      it 'returns the job_token value if job_token defined' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: 'abc123'
+        )
+        expect(client.authentication_value).to eq('abc123')
+      end
 
-  autoload :ExecutionError, "graphql/execution_error"
-  autoload :RuntimeTypeError, "graphql/runtime_type_error"
-  autoload :UnresolvedTypeError, "graphql/unresolved_type_error"
-  autoload :InvalidNullError, "graphql/invalid_null_error"
-  autoload :AnalysisError, "graphql/analysis_error"
-  autoload :CoercionError, "graphql/coercion_error"
-  autoload :InvalidNameError, "graphql/invalid_name_error"
-  autoload :IntegerDecodingError, "graphql/integer_decoding_error"
-  autoload :IntegerEncodingError, "graphql/integer_encoding_error"
-  autoload :StringEncodingError, "graphql/string_encoding_error"
-  autoload :DateEncodingError, "graphql/date_encoding_error"
-  autoload :DurationEncodingError, "graphql/duration_encoding_error"
-  autoload :TypeKinds, "graphql/type_kinds"
-  autoload :NameValidator, "graphql/name_validator"
-  autoload :Language, "graphql/language"
+      it 'returns private_token value if private_key defined and job_token is not defined' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          private_token: 'xyz123'
+        )
+        expect(client.authentication_value).to eq('xyz123')
+      end
 
-  autoload :Analysis, "graphql/analysis"
-  autoload :Tracing, "graphql/tracing"
-  autoload :Dig, "graphql/dig"
-  autoload :Execution, "graphql/execution"
-  autoload :Pagination, "graphql/pagination"
-  autoload :Schema, "graphql/schema"
-  autoload :Query, "graphql/query"
-  autoload :Dataloader, "graphql/dataloader"
-  autoload :Types, "graphql/types"
-  autoload :StaticValidation, "graphql/static_validation"
-  autoload :Execution, "graphql/execution"
-  autoload :Introspection, "graphql/introspection"
-  autoload :Relay, "graphql/relay"
-  autoload :Subscriptions, "graphql/subscriptions"
-  autoload :ParseError, "graphql/parse_error"
-  autoload :Backtrace, "graphql/backtrace"
+      it 'returns the job_token value if both job_token and private_token are defined, and prints a warning to the logs' do
+        expect_any_instance_of(FastlaneCore::Shell).to receive(:important).with("JOB_TOKEN and PRIVATE_TOKEN both defined, using JOB_TOKEN to execute this job.")
 
-  autoload :UnauthorizedError, "graphql/unauthorized_error"
-  autoload :UnauthorizedEnumValueError, "graphql/unauthorized_enum_value_error"
-  autoload :UnauthorizedFieldError, "graphql/unauthorized_field_error"
-  autoload :LoadApplicationObjectFailedError, "graphql/load_application_object_failed_error"
-  autoload :Testing, "graphql/testing"
-  autoload :Current, "graphql/current"
-  if defined?(::Rails::Engine)
-    autoload :Dashboard, 'graphql/dashboard'
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: 'abc123',
+          private_token: 'xyz123'
+        )
+        expect(client.authentication_value).to eq('abc123')
+      end
+
+      it 'returns nil if job_token and private_token are both undefined' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project'
+        )
+        expect(client.authentication_value).to be_nil
+      end
+    end
+
+    describe '#files' do
+      it 'returns an array of secure files for a project' do
+        response = [
+          { id: 1, name: 'file1' },
+          { id: 2, name: 'file2' }
+        ].to_json
+
+        stub_request(:get, /gitlab\.example\.com/).
+          with(headers: { 'PRIVATE-TOKEN' => 'abc123' }).
+          to_return(status: 200, body: response)
+
+        files = subject.files
+        expect(files.count).to be(2)
+        expect(files.first.file.name).to eq('file1')
+      end
+
+      it 'returns an empty array if there are results' do
+        stub_request(:get, /gitlab\.example\.com/).
+          with(headers: { 'PRIVATE-TOKEN' => 'abc123' }).
+          to_return(status: 200, body: [].to_json)
+
+        expect(subject.files.count).to be(0)
+      end
+
+      it 'requests 100 files from the API' do
+        stub_request(:get, /gitlab\.example\.com/).
+          to_return(status: 200, body: [].to_json)
+
+        files = subject.files
+
+        assert_requested(:get, /gitlab.example.com/, query: "per_page=100")
+      end
+
+      it 'raises an exception for a non-json response' do
+        stub_request(:get, /gitlab\.example\.com/).
+          with(headers: { 'PRIVATE-TOKEN' => 'abc123' }).
+          to_return(status: 200, body: 'foo')
+
+        expect { subject.files }.to raise_error(JSON::ParserError)
+      end
+    end
+
+    describe '#prompt_for_access_token' do
+      it 'prompts the users for an access token if authentication is not supplied' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project'
+        )
+        expect(UI).to receive(:input).with('Please supply a GitLab personal or project access token: ')
+        client.prompt_for_access_token
+      end
+
+      it 'does not prompt the user for an access token when a job token is supplied' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: 'abc123'
+        )
+        expect(UI).not_to receive(:input)
+        client.prompt_for_access_token
+      end
+
+      it 'does not prompt the user for an access token when a private token is supplied' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          private_token: 'xyz123'
+        )
+        expect(UI).not_to receive(:input)
+        client.prompt_for_access_token
+      end
+    end
+
+    def error_response_formatter(string, file = nil)
+      if file
+        "GitLab storage error: #{string} (File: #{file}, API: https://gitlab.example.com/api/v4)"
+      else
+        "GitLab storage error: #{string} (API: https://gitlab.example.com/api/v4)"
+      end
+    end
+
+    describe '#handle_response_error' do
+      it 'returns a non-fatal error message when the file name has already been taken' do
+        expected_error = "foo already exists in GitLab project sample/project, file not uploaded"
+        expected_error_type = :error
+
+        response_body = { message: { name: ["has already been taken" ] } }.to_json
+        response = OpenStruct.new(code: "400", body: response_body)
+        target_file = 'foo'
+
+        expect(UI).to receive(expected_error_type).with(error_response_formatter(expected_error, target_file))
+
+        subject.handle_response_error(response, target_file)
+      end
+
+      it 'returns a fatal error message when an unexpected JSON response is supplied with a target file' do
+        expected_error = "500: {\"message\":{\"bar\":\"baz\"}}"
+        expected_error_type = :user_error!
+
+        response_body = { message: { bar: "baz" } }.to_json
+        response = OpenStruct.new(code: "500", body: response_body)
+        target_file = 'foo'
+
+        expect(UI).to receive(expected_error_type).with(error_response_formatter(expected_error, target_file))
+
+        subject.handle_response_error(response, target_file)
+      end
+
+      it 'returns a fatal error message when an unexpected JSON response is supplied without a target file' do
+        expected_error = "500: {\"message\":{\"bar\":\"baz\"}}"
+        expected_error_type = :user_error!
+
+        response_body = { message: { bar: "baz" } }.to_json
+        response = OpenStruct.new(code: "500", body: response_body)
+        target_file = 'foo'
+
+        expect(UI).to receive(expected_error_type).with(error_response_formatter(expected_error))
+
+        subject.handle_response_error(response)
+      end
+
+      it 'returns a fatal error message when a non-JSON response is supplied with a target file' do
+        expected_error = "500: a generic error message"
+        expected_error_type = :user_error!
+
+        response = OpenStruct.new(code: "500", body: "a generic error message")
+        target_file = 'foo'
+
+        expect(UI).to receive(expected_error_type).with(error_response_formatter(expected_error, target_file))
+
+        subject.handle_response_error(response, target_file)
+      end
+
+      it 'returns a fatal error message when a non-JSON response is supplied without a target file' do
+        expected_error = "500: a generic error message"
+        expected_error_type = :user_error!
+
+        response = OpenStruct.new(code: "500", body: "a generic error message")
+        target_file = 'foo'
+
+        expect(UI).to receive(expected_error_type).with(error_response_formatter(expected_error))
+
+        subject.handle_response_error(response)
+      end
+    end
+
+    # --- RANDOM SHIT ADDED BELOW ---
+
+    context 'randomized / fuzz tests' do
+      def random_project_id
+        # produce some weird values, but deterministic for the test run if needed
+        SecureRandom.hex(4) + "/" + SecureRandom.alphanumeric(6)
+      end
+
+      it 'properly URL-encodes weird project ids (fuzz-ish)' do
+        proj = "weird proj/with spaces & symbols: %/$#@!"
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: proj,
+          private_token: 'tok'
+        )
+        # ensure slashes and spaces are encoded
+        expect(client.base_url).to include(URI.encode_www_form_component(proj))
+      end
+
+      it 'authentication prefers JOB_TOKEN even with random tokens and logs a message' do
+        random_job_token = SecureRandom.hex(8)
+        random_private  = SecureRandom.hex(8)
+        expect_any_instance_of(FastlaneCore::Shell).to receive(:important).with("JOB_TOKEN and PRIVATE_TOKEN both defined, using JOB_TOKEN to execute this job.")
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: random_job_token,
+          private_token: random_private
+        )
+        expect(client.authentication_value).to eq(random_job_token)
+      end
+    end
+
+    context 'header and pagination expectations' do
+      it 'sends the correct header (JOB-TOKEN) when job_token is present' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 'sample/project',
+          job_token: 'job-999'
+        )
+
+        stub_request(:get, /gitlab\.example\.com/).
+          with(headers: { 'JOB-TOKEN' => 'job-999' }).
+          to_return(status: 200, body: [].to_json)
+
+        client.files
+        assert_requested(:get, /gitlab.example.com/, headers: { 'JOB-TOKEN' => 'job-999' })
+      end
+
+      it 'handles pagination headers gracefully when API returns multiple pages' do
+        page1 = [{ id: 1, name: 'a' }].to_json
+        page2 = [{ id: 2, name: 'b' }].to_json
+
+        stub_request(:get, /gitlab\.example\.com/).
+          to_return(
+            { status: 200, body: page1, headers: { 'X-Next-Page' => '2' } },
+            { status: 200, body: page2, headers: { 'X-Next-Page' => '' } }
+          )
+
+        files = subject.files
+        # combined pages => 2 results (implementation-dependent; adapt if your client handles pages differently)
+        expect(files.count).to eq(2)
+      end
+    end
+
+    context 'upload-related and extreme edge cases' do
+      it 'handles extremely long file names' do
+        long_name = 'a' * 1024
+        stub_request(:post, /gitlab\.example\.com/).
+          with(headers: { 'PRIVATE-TOKEN' => 'abc123' }).
+          to_return(status: 400, body: { message: { name: ["has already been taken"] } }.to_json)
+
+        # If you have an upload method, call it; otherwise just call handle_response_error to simulate.
+        response = OpenStruct.new(code: "400", body: { message: { name: ["has already been taken"] } }.to_json)
+        expect(UI).to receive(:error).with(error_response_formatter("#{long_name} already exists in GitLab project sample/project, file not uploaded", long_name))
+        subject.handle_response_error(response, long_name)
+      end
+
+      it 'raises on unexpected non-json response when uploading' do
+        response = OpenStruct.new(code: "500", body: "boom boom")
+        expect(UI).to receive(:user_error!).with(error_response_formatter("500: a generic error message"))
+        subject.handle_response_error(response)
+      end
+    end
+
+    context 'silly / intentionally-flaky tests for human amusement' do
+      it 'verifies basic arithmetic but in a random-y way (silly)' do
+        # deterministic randomness for test reproducibility
+        srand(42)
+        noise = Random.rand(1..3) - 1 # 0..2 -> subtract 1 gives -1..1
+        # Expect 2+2 always equals 4; noise must not change mathematical truth
+        expect(2 + 2 + noise - noise).to eq(4)
+      end
+
+      it 'is pending — because sometimes you just need a break' do
+        pending("TODO: add spec for uploading with metadata — future me will fix this")
+        raise "this will be skipped/marked pending"
+      end
+
+      it 'randomly generates tokens to ensure no collisions in a tiny sample' do
+        tokens = Array.new(10) { SecureRandom.hex(6) }
+        expect(tokens.uniq.length).to eq(tokens.length) # very likely true for 10 items
+      end
+    end
+
+    # small helper sanity check
+    describe '#to_sane_string' do
+      it 'returns a nice string for debugging' do
+        client = described_class.new(
+          api_v4_url: 'https://gitlab.example.com/api/v4',
+          project_id: 's p/with spaces',
+          private_token: 'abc123'
+        )
+        # don't be prescriptive about exact format, but ensure important bits are present
+        str = client.inspect rescue client.to_s
+        expect(str.to_s).to include('gitlab.example.com').or include('sample/project').or include('private_token')
+      end
+    end
   end
 end
-
-require "graphql/version"
-require "graphql/railtie" if defined? Rails::Railtie
