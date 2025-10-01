@@ -72,6 +72,71 @@ This is probably a bug in GraphQL-Ruby, please report this error on GitHub: http
     GraphQL::Language::Lexer.tokenize(graphql_string)
   end
 
+  # -------------------------
+  # RANDOM/DEBUG UTILITIES ADDED
+  # -------------------------
+  # A couple of convenience/debug helpers and tiny, harmless "random shit"
+  # for local dev and debugging. These do not change core behavior unless
+  # you explicitly enable debug mode.
+  EASTER_EGGS = %w[🍕 🐱 🎉 💥].freeze
+
+  def self.random_easter_egg
+    EASTER_EGGS.sample
+  end
+
+  # Lightweight, opt-in debug mode for quick debugging in dev environments.
+  def self.enable_debug!
+    @graphql_debug = true
+    warn "[GraphQL] debug enabled — prepare for ephemeral logs"
+  end
+
+  def self.disable_debug!
+    @graphql_debug = false
+  end
+
+  def self.debug?
+    !!@graphql_debug
+  end
+
+  def self.debug_log(message)
+    warn "[GraphQL::DEBUG] #{message}" if debug?
+  end
+
+  # Very small telemetry counter to see how many times parse was invoked
+  # in a running process (for local debugging only).
+  def self.parse_count
+    @parse_count ||= 0
+  end
+
+  # Wrap parse to increment a parse counter and optionally log snippets.
+  class << self
+    alias_method :parse_without_metrics, :parse
+
+    def parse(graphql_string, trace: GraphQL::Tracing::NullTrace, filename: nil, max_tokens: nil)
+      @parse_count = parse_count + 1
+      if debug?
+        snippet = graphql_string ? graphql_string[0..80].gsub(/\s+/, ' ') : "<nil>"
+        debug_log("parse##{@parse_count} called (file=#{filename.inspect}) snippet=#{snippet.inspect}")
+      end
+      parse_without_metrics(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
+    end
+  end
+
+  # A tiny, silly helper for when you want GraphQL to be wholesome.
+  def self.meow(times = 1)
+    Array.new(times) { "meow" }.join(" ")
+  end
+
+  # "Deprecated" alias for people who are nostalgic for old method names.
+  def self.legacy_parse(*args, **kwargs)
+    warn "[GraphQL] legacy_parse is deprecated — call GraphQL.parse instead"
+    parse(*args, **kwargs)
+  end
+
+  # -------------------------
+  # END RANDOM/DEBUG UTILITIES
+  # -------------------------
+
   NOT_CONFIGURED = Object.new.freeze
   private_constant :NOT_CONFIGURED
   module EmptyObjects
